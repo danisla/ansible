@@ -29,6 +29,8 @@
 
 # == BEGIN DYNAMICALLY INSERTED CODE ==
 
+ANSIBLE_VERSION = "<<ANSIBLE_VERSION>>"
+
 MODULE_ARGS = "<<INCLUDE_ANSIBLE_MODULE_ARGS>>"
 MODULE_COMPLEX_ARGS = "<<INCLUDE_ANSIBLE_MODULE_COMPLEX_ARGS>>"
 
@@ -53,6 +55,7 @@ import sys
 import syslog
 import types
 import time
+import select
 import shutil
 import stat
 import tempfile
@@ -149,10 +152,11 @@ FILE_COMMON_ARGUMENTS=dict(
     selevel = dict(),
     setype = dict(),
     # not taken by the file module, but other modules call file so it must ignore them.
-    content = dict(),
+    content = dict(no_log=True),
     backup = dict(),
     force = dict(),
     remote_src = dict(), # used by assemble
+    regexp = dict(), # used by assemble
     delimiter = dict(), # used by assemble
     directory_mode = dict(), # used by copy
 )
@@ -167,8 +171,6 @@ def get_distribution():
     if platform.system() == 'Linux':
         try:
             distribution = platform.linux_distribution()[0].capitalize()
-            if " " in distribution:
-                distribution = distribution.split()[0]
             if not distribution and os.path.isfile('/etc/system-release'):
                 distribution = platform.linux_distribution(supported_dists=['system'])[0].capitalize()
                 if 'Amazon' in distribution:
@@ -187,6 +189,8 @@ def get_distribution_version():
     if platform.system() == 'Linux':
         try:
             distribution_version = platform.linux_distribution()[1]
+            if not distribution_version and os.path.isfile('/etc/system-release'):
+                distribution_version = platform.linux_distribution(supported_dists=['system'])[1]
         except:
             # FIXME: MethodMissing, I assume?
             distribution_version = platform.dist()[1]
@@ -217,7 +221,6 @@ def load_platform_subclass(cls, *args, **kwargs):
         subclass = cls
 
     return super(cls, subclass).__new__(subclass)
-
 
 class AnsibleModule(object):
 
@@ -516,17 +519,23 @@ class AnsibleModule(object):
 
     def set_mode_if_different(self, path, mode, changed):
         path = os.path.expanduser(path)
+        path_stat = os.lstat(path)
+
         if mode is None:
             return changed
-        try:
-            # FIXME: support English modes
-            if not isinstance(mode, int):
-                mode = int(mode, 8)
-        except Exception, e:
-            self.fail_json(path=path, msg='mode needs to be something octalish', details=str(e))
 
-        st = os.lstat(path)
-        prev_mode = stat.S_IMODE(st[stat.ST_MODE])
+        if not isinstance(mode, int):
+            try:
+                mode = int(mode, 8)
+            except Exception:
+                try:
+                    mode = self._symbolic_mode_to_octal(path_stat, mode)
+                except Exception, e:
+                    self.fail_json(path=path,
+                                   msg="mode must be in octal or symbolic form",
+                                   details=str(e))
+
+        prev_mode = stat.S_IMODE(path_stat.st_mode)
 
         if prev_mode != mode:
             if self.check_mode:
@@ -548,12 +557,106 @@ class AnsibleModule(object):
             except Exception, e:
                 self.fail_json(path=path, msg='chmod failed', details=str(e))
 
-            st = os.lstat(path)
-            new_mode = stat.S_IMODE(st[stat.ST_MODE])
+            path_stat = os.lstat(path)
+            new_mode = stat.S_IMODE(path_stat.st_mode)
 
             if new_mode != prev_mode:
                 changed = True
         return changed
+
+    def _symbolic_mode_to_octal(self, path_stat, symbolic_mode):
+        new_mode = stat.S_IMODE(path_stat.st_mode)
+
+        mode_re = re.compile(r'^(?P<users>[ugoa]+)(?P<operator>[-+=])(?P<perms>[rwxXst]*|[ugo])$')
+        for mode in symbolic_mode.split(','):
+            match = mode_re.match(mode)
+            if match:
+                users = match.group('users')
+                operator = match.group('operator')
+                perms = match.group('perms')
+
+                if users == 'a': users = 'ugo'
+
+                for user in users:
+                    mode_to_apply = self._get_octal_mode_from_symbolic_perms(path_stat, user, perms)
+                    new_mode = self._apply_operation_to_mode(user, operator, mode_to_apply, new_mode)
+            else:
+                raise ValueError("bad symbolic permission for mode: %s" % mode)
+        return new_mode
+    
+    def _apply_operation_to_mode(self, user, operator, mode_to_apply, current_mode):
+        if operator  ==  '=':
+            if user == 'u': mask = stat.S_IRWXU | stat.S_ISUID
+            elif user == 'g': mask = stat.S_IRWXG | stat.S_ISGID
+            elif user == 'o': mask = stat.S_IRWXO | stat.S_ISVTX
+            
+            # mask out u, g, or o permissions from current_mode and apply new permissions   
+            inverse_mask = mask ^ 07777
+            new_mode = (current_mode & inverse_mask) | mode_to_apply
+        elif operator == '+':
+            new_mode = current_mode | mode_to_apply
+        elif operator == '-':
+            new_mode = current_mode - (current_mode & mode_to_apply)
+        return new_mode
+        
+    def _get_octal_mode_from_symbolic_perms(self, path_stat, user, perms):
+        prev_mode = stat.S_IMODE(path_stat.st_mode)
+        
+        is_directory = stat.S_ISDIR(path_stat.st_mode)
+        has_x_permissions = (prev_mode & 00111) > 0
+        apply_X_permission = is_directory or has_x_permissions
+
+        # Permission bits constants documented at:
+        # http://docs.python.org/2/library/stat.html#stat.S_ISUID
+        if apply_X_permission:
+            X_perms = {
+                'u': {'X': stat.S_IXUSR},
+                'g': {'X': stat.S_IXGRP},
+                'o': {'X': stat.S_IXOTH}
+            }
+        else:
+            X_perms = {
+                'u': {'X': 0},
+                'g': {'X': 0},
+                'o': {'X': 0}
+            }
+
+        user_perms_to_modes = {
+            'u': {
+                'r': stat.S_IRUSR,
+                'w': stat.S_IWUSR,
+                'x': stat.S_IXUSR,
+                's': stat.S_ISUID,
+                't': 0,
+                'u': prev_mode & stat.S_IRWXU,
+                'g': (prev_mode & stat.S_IRWXG) << 3,
+                'o': (prev_mode & stat.S_IRWXO) << 6 },
+            'g': {
+                'r': stat.S_IRGRP,
+                'w': stat.S_IWGRP,
+                'x': stat.S_IXGRP,
+                's': stat.S_ISGID,
+                't': 0,
+                'u': (prev_mode & stat.S_IRWXU) >> 3,
+                'g': prev_mode & stat.S_IRWXG,
+                'o': (prev_mode & stat.S_IRWXO) << 3 },
+            'o': {
+                'r': stat.S_IROTH,
+                'w': stat.S_IWOTH,
+                'x': stat.S_IXOTH,
+                's': 0,
+                't': stat.S_ISVTX,
+                'u': (prev_mode & stat.S_IRWXU) >> 6,
+                'g': (prev_mode & stat.S_IRWXG) >> 3,
+                'o': prev_mode & stat.S_IRWXO }
+        }
+
+        # Insert X_perms into user_perms_to_modes
+        for key, value in X_perms.items():
+            user_perms_to_modes[key].update(value)
+
+        or_reduce = lambda mode, perm: mode | user_perms_to_modes[user][perm]
+        return reduce(or_reduce, perms, 0)
 
     def set_fs_attributes_if_different(self, file_args, changed):
         # set modes owners and context as needed
@@ -646,7 +749,7 @@ class AnsibleModule(object):
             required = v.get('required', False)
             if default is not None and required:
                 # not alias specific but this is a good place to check this
-                self.fail_json(msg="internal error: required and default are mutally exclusive for %s" % k)
+                self.fail_json(msg="internal error: required and default are mutually exclusive for %s" % k)
             if aliases is None:
                 continue
             if type(aliases) != list:
@@ -805,7 +908,7 @@ class AnsibleModule(object):
                                     self.fail_json(msg="unable to evaluate dictionary for %s" % k)
                                 self.params[k] = result
                         elif '=' in value:
-                            self.params[k] = dict([x.split("=", 1) for x in value.split(",")])
+                            self.params[k] = dict([x.strip().split("=", 1) for x in value.split(",")])
                         else:
                             self.fail_json(msg="dictionary requested, could not parse JSON or key=value")
                     else:
@@ -856,6 +959,8 @@ class AnsibleModule(object):
                 (k, v) = x.split("=",1)
             except Exception, e:
                 self.fail_json(msg="this module requires key=value arguments (%s)" % (items))
+            if k in params:
+                self.fail_json(msg="duplicate parameter: %s (value=%s)" % (k, v))
             params[k] = v
         params2 = json.loads(MODULE_COMPLEX_ARGS)
         params2.update(params)
@@ -879,7 +984,7 @@ class AnsibleModule(object):
             arg_opts = self.argument_spec.get(canon, {})
             no_log = arg_opts.get('no_log', False)
                 
-            if no_log:
+            if self.boolean(no_log):
                 log_args[param] = 'NOT_LOGGING_PARAMETER'
             elif param in passwd_keys:
                 log_args[param] = 'NOT_LOGGING_PASSWORD'
@@ -1121,14 +1226,17 @@ class AnsibleModule(object):
             # Optimistically try a rename, solves some corner cases and can avoid useless work, throws exception if not atomic.
             os.rename(src, dest)
         except (IOError,OSError), e:
-            # only try workarounds for errno 18 (cross device), 1 (not permited) and 13 (permission denied)
+            # only try workarounds for errno 18 (cross device), 1 (not permitted) and 13 (permission denied)
             if e.errno != errno.EPERM and e.errno != errno.EXDEV and e.errno != errno.EACCES:
                 self.fail_json(msg='Could not replace file: %s to %s: %s' % (src, dest, e))
 
             dest_dir = os.path.dirname(dest)
             dest_file = os.path.basename(dest)
-            tmp_dest = tempfile.NamedTemporaryFile(
-                prefix=".ansible_tmp", dir=dest_dir, suffix=dest_file)
+            try:
+                tmp_dest = tempfile.NamedTemporaryFile(
+                    prefix=".ansible_tmp", dir=dest_dir, suffix=dest_file)
+            except (OSError, IOError), e:
+                self.fail_json(msg='The destination directory (%s) is not writable by the current user.' % dest_dir)
 
             try: # leaves tmp file behind when sudo and  not root
                 if switched_user and os.getuid() != 0:
@@ -1140,9 +1248,13 @@ class AnsibleModule(object):
                 if self.selinux_enabled():
                     self.set_context_if_different(
                         tmp_dest.name, context, False)
-                tmp_stat = os.stat(tmp_dest.name)
-                if dest_stat and (tmp_stat.st_uid != dest_stat.st_uid or tmp_stat.st_gid != dest_stat.st_gid):
-                    os.chown(tmp_dest.name, dest_stat.st_uid, dest_stat.st_gid)
+                try:
+                    tmp_stat = os.stat(tmp_dest.name)
+                    if dest_stat and (tmp_stat.st_uid != dest_stat.st_uid or tmp_stat.st_gid != dest_stat.st_gid):
+                        os.chown(tmp_dest.name, dest_stat.st_uid, dest_stat.st_gid)
+                except OSError, e:
+                    if e.errno != errno.EPERM:
+                        raise
                 os.rename(tmp_dest.name, dest)
             except (shutil.Error, OSError, IOError), e:
                 self.cleanup(tmp_dest.name)
@@ -1161,7 +1273,7 @@ class AnsibleModule(object):
             # rename might not preserve context
             self.set_context_if_different(dest, context, False)
 
-    def run_command(self, args, check_rc=False, close_fds=False, executable=None, data=None, binary_data=False, path_prefix=None, cwd=None, use_unsafe_shell=False):
+    def run_command(self, args, check_rc=False, close_fds=True, executable=None, data=None, binary_data=False, path_prefix=None, cwd=None, use_unsafe_shell=False):
         '''
         Execute a command, returns rc, stdout, and stderr.
         args is the command to run
@@ -1172,7 +1284,7 @@ class AnsibleModule(object):
         - check_rc (boolean)  Whether to call fail_json in case of
                               non zero RC.  Default is False.
         - close_fds (boolean) See documentation for subprocess.Popen().
-                              Default is False.
+                              Default is True.
         - executable (string) See documentation for subprocess.Popen().
                               Default is None.
         '''
@@ -1235,7 +1347,7 @@ class AnsibleModule(object):
             executable=executable,
             shell=shell,
             close_fds=close_fds,
-            stdin= st_in,
+            stdin=st_in,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE 
         )
@@ -1253,15 +1365,53 @@ class AnsibleModule(object):
             try:
                 os.chdir(cwd)
             except (OSError, IOError), e:
-                self.fail_json(rc=e.errno, msg="Could not open %s , %s" % (cwd, str(e)))
+                self.fail_json(rc=e.errno, msg="Could not open %s, %s" % (cwd, str(e)))
 
         try:
             cmd = subprocess.Popen(args, **kwargs)
 
+            # the communication logic here is essentially taken from that
+            # of the _communicate() function in ssh.py
+
+            stdout = ''
+            stderr = ''
+            rpipes = [cmd.stdout, cmd.stderr]
+
             if data:
                 if not binary_data:
                     data += '\n'
-            out, err = cmd.communicate(input=data)
+                cmd.stdin.write(data)
+                cmd.stdin.close()
+
+            while True:
+                rfd, wfd, efd = select.select(rpipes, [], rpipes, 1)
+                if cmd.stdout in rfd:
+                    dat = os.read(cmd.stdout.fileno(), 9000)
+                    stdout += dat
+                    if dat == '':
+                        rpipes.remove(cmd.stdout)
+                if cmd.stderr in rfd:
+                    dat = os.read(cmd.stderr.fileno(), 9000)
+                    stderr += dat
+                    if dat == '':
+                        rpipes.remove(cmd.stderr)
+                # only break out if no pipes are left to read or
+                # the pipes are completely read and
+                # the process is terminated
+                if (not rpipes or not rfd) and cmd.poll() is not None:
+                    break
+                # No pipes are left to read but process is not yet terminated
+                # Only then it is safe to wait for the process to be finished
+                # NOTE: Actually cmd.poll() is always None here if rpipes is empty
+                elif not rpipes and cmd.poll() == None:
+                    cmd.wait()
+                    # The process is terminated. Since no pipes to read from are
+                    # left, there is no need to call select() again.
+                    break
+
+            cmd.stdout.close()
+            cmd.stderr.close()
+
             rc = cmd.returncode
         except (OSError, IOError), e:
             self.fail_json(rc=e.errno, msg=str(e), cmd=clean_args)
@@ -1269,13 +1419,13 @@ class AnsibleModule(object):
             self.fail_json(rc=257, msg=traceback.format_exc(), cmd=clean_args)
 
         if rc != 0 and check_rc:
-            msg = err.rstrip()
-            self.fail_json(cmd=clean_args, rc=rc, stdout=out, stderr=err, msg=msg)
+            msg = stderr.rstrip()
+            self.fail_json(cmd=clean_args, rc=rc, stdout=stdout, stderr=stderr, msg=msg)
 
         # reset the pwd
         os.chdir(prev_dir)
 
-        return (rc, out, err)
+        return (rc, stdout, stderr)
 
     def append_to_file(self, filename, str):
         filename = os.path.expandvars(os.path.expanduser(filename))

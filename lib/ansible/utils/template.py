@@ -80,7 +80,8 @@ class Flags:
 
 FILTER_PLUGINS = None
 _LISTRE = re.compile(r"(\w+)\[(\d+)\]")
-JINJA2_OVERRIDE='#jinja2:'
+JINJA2_OVERRIDE = '#jinja2:'
+JINJA2_ALLOWED_OVERRIDES = ['trim_blocks', 'lstrip_blocks', 'newline_sequence', 'keep_trailing_newline']
 
 def lookup(name, *args, **kwargs):
     from ansible import utils
@@ -91,9 +92,6 @@ def lookup(name, *args, **kwargs):
         # safely catch run failures per #5059
         try:
             ran = instance.run(*args, inject=vars, **kwargs)
-        except errors.AnsibleError:
-            # Plugin raised this on purpose
-            raise
         except Exception, e:
             ran = None
         if ran:
@@ -197,7 +195,7 @@ class J2Template(jinja2.environment.Template):
     This class prevents Jinja2 from running _jinja2_vars through dict()
     Without this, {% include %} and similar will create new contexts unlike
     the special one created in template_from_file. This ensures they are all
-    alike, with the exception of potential locals.
+    alike, except for potential locals.
     '''
     def new_context(self, vars=None, shared=False, locals=None):
         return jinja2.runtime.Context(self.environment, vars.add_locals(locals), self.name, self.blocks)
@@ -231,7 +229,6 @@ def template_from_file(basedir, path, vars, vault_password=None):
     except:
         raise errors.AnsibleError("unable to read %s" % realpath)
 
-
     # Get jinja env overrides from template
     if data.startswith(JINJA2_OVERRIDE):
         eol = data.find('\n')
@@ -239,7 +236,10 @@ def template_from_file(basedir, path, vars, vault_password=None):
         data = data[eol+1:]
         for pair in line.split(','):
             (key,val) = pair.split(':')
-            setattr(environment,key.strip(),ast.literal_eval(val.strip()))
+            key = key.strip()
+            if key in JINJA2_ALLOWED_OVERRIDES:
+                setattr(environment, key, ast.literal_eval(val.strip()))
+
 
     environment.template_class = J2Template
     try:
@@ -362,7 +362,7 @@ def template_from_string(basedir, data, vars, fail_on_undefined=False):
                     "Make sure your variable name does not contain invalid characters like '-'."
                 )
             else:
-                raise errors.AnsibleError("an unexpected type error occured. Error was %s" % te)
+                raise errors.AnsibleError("an unexpected type error occurred. Error was %s" % te)
         return res
     except (jinja2.exceptions.UndefinedError, errors.AnsibleUndefinedVariable):
         if fail_on_undefined:

@@ -9,7 +9,7 @@ from ansible import __version__, __author__
 try:
     from setuptools import setup
 except ImportError:
-    print "Ansible now needs setuptools in order to build. " + \
+    print "Ansible now needs setuptools in order to build. " \
           "Install it using your package manager (usually python-setuptools) or via pip (pip install setuptools)."
     sys.exit(1)
 
@@ -38,6 +38,7 @@ setup(name='ansible',
       package_dir={ 'ansible': 'lib/ansible' },
       packages=[
          'ansible',
+         'ansible.cache',
          'ansible.utils',
          'ansible.utils.module_docs_fragments',
          'ansible.inventory',
@@ -52,6 +53,9 @@ setup(name='ansible',
          'ansible.callback_plugins',
          'ansible.module_utils'
       ],
+      package_data={
+         '': ['module_utils/*.ps1'],
+      },
       scripts=[
          'bin/ansible',
          'bin/ansible-playbook',

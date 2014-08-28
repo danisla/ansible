@@ -94,7 +94,8 @@ class Connection(object):
             self.common_args += ["-o", "KbdInteractiveAuthentication=no",
                                  "-o", "PreferredAuthentications=gssapi-with-mic,gssapi-keyex,hostbased,publickey",
                                  "-o", "PasswordAuthentication=no"]
-        self.common_args += ["-o", "User=" + (self.user or pwd.getpwuid(os.geteuid())[0])]
+        if self.user != pwd.getpwuid(os.geteuid())[0]:
+            self.common_args += ["-o", "User="+self.user]
         self.common_args += ["-o", "ConnectTimeout=%d" % self.runner.timeout]
 
         return self
@@ -274,7 +275,6 @@ class Connection(object):
 
         if su and su_user:
             sudocmd, prompt, success_key = utils.make_su_cmd(su_user, executable, cmd)
-            prompt_re = re.compile(prompt)
             ssh_cmd.append(sudocmd)
         elif not self.runner.sudo or not sudoable:
             prompt = None
@@ -318,7 +318,7 @@ class Connection(object):
             while True:
                 if success_key in sudo_output or \
                     (self.runner.sudo_pass and sudo_output.endswith(prompt)) or \
-                    (self.runner.su_pass and prompt_re.match(sudo_output)):
+                    (self.runner.su_pass and utils.su_prompts.check_su_prompt(sudo_output)):
                     break
 
                 rfd, wfd, efd = select.select([p.stdout, p.stderr], [],
